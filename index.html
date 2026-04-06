@@ -117,8 +117,8 @@
           .from('grid_manager')
           .select('manager')
           .eq('user_code', userCode)
-          .single();
-        if (error && error.code !== 'PGRST116') throw error;
+          .maybeSingle();
+        if (error) throw error;
         return data ? data.manager : null;
       },
       async setManager(userCode, manager) {
@@ -133,8 +133,8 @@
           .select('config')
           .eq('user_code', userCode)
           .eq('asset_id', String(assetId))
-          .single();
-        if (error && error.code !== 'PGRST116') throw error;
+          .maybeSingle();
+        if (error) throw error;
         return data ? data.config : null;
       },
       async setConfig(userCode, assetId, config) {
@@ -149,8 +149,8 @@
           .select('records')
           .eq('user_code', userCode)
           .eq('asset_id', String(assetId))
-          .single();
-        if (error && error.code !== 'PGRST116') throw error;
+          .maybeSingle();
+        if (error) throw error;
         return data ? data.records : null;
       },
       async setRecords(userCode, assetId, records) {
