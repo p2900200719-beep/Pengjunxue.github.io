@@ -547,6 +547,40 @@
     };
 
     // =============================================
+    // 网格点位计算（统一逻辑，与完整网格计划保持一致）
+    // =============================================
+    const calcGridLevels = (lastPrice, config, totalShares, levels = 3) => {
+      const gridPct = config.gridSizePct / 100;
+      const skyLine = config.skyLine;
+      const groundLine = config.groundLine;
+      const minBuy = config.minBuy || 1000;
+      const maxBuy = config.maxBuy || 5000;
+
+      const sellLevels = [];
+      let sp = lastPrice * (1 + gridPct);
+      for (let i = 1; i <= levels; i++) {
+        let sellRatio = skyLine > lastPrice ? (sp - lastPrice) / (skyLine - lastPrice) : 1;
+        sellRatio = Math.max(0, Math.min(1, sellRatio));
+        const shares = Math.round(totalShares * sellRatio);
+        sellLevels.push({ level: i, price: sp, shares, amount: Math.round(shares * sp) });
+        sp = sp * (1 + gridPct);
+      }
+
+      const buyLevels = [];
+      let bp = lastPrice * (1 - gridPct);
+      for (let i = 1; i <= levels; i++) {
+        let buyRatio = (skyLine - groundLine) > 0 ? (skyLine - bp) / (skyLine - groundLine) : 0.5;
+        buyRatio = Math.max(0, Math.min(1, buyRatio));
+        const amount = Math.round(minBuy + buyRatio * (maxBuy - minBuy));
+        const shares = bp > 0 ? Math.round(amount / bp) : 0;
+        buyLevels.push({ level: i, price: bp, shares, amount });
+        bp = bp * (1 - gridPct);
+      }
+
+      return { sellLevels, buyLevels };
+    };
+
+    // =============================================
     // 基础 UI 组件
     // =============================================
     const Card = ({ children, className = "" }) => (
@@ -1305,41 +1339,33 @@
                   <div className="px-4 py-6 text-center text-xs text-slate-400">暂无交易记录，无法计算点位</div>
                 ) : (() => {
                   const lastPrice = nextActionAnalysis.lastPrice;
-                  const g = config.gridSizePct / 100;
-                  const s1 = lastPrice * (1+g), s2 = s1*(1+g), s3 = s2*(1+g);
-                  const b1 = lastPrice * (1-g), b2 = b1*(1-g), b3 = b2*(1-g);
                   const totalShares = Math.max(0, Math.round(stats.totalShares));
-                  const sell1Shares = Math.round(totalShares * 0.33);
-                  const sell2Shares = Math.round(totalShares * 0.33);
-                  const sell3Shares = totalShares - sell1Shares - sell2Shares;
-                  const buy1Shares = b1 > 0 ? Math.round((config.minBuy||1000)/b1) : 0;
-                  const buy2Shares = b2 > 0 ? Math.round(((config.minBuy||1000)+(config.maxBuy||5000))/2/b2) : 0;
-                  const buy3Shares = b3 > 0 ? Math.round((config.maxBuy||5000)/b3) : 0;
+                  // 使用统一计算函数（与完整网格计划一致）
+                  const { sellLevels, buyLevels } = calcGridLevels(lastPrice, config, totalShares, 3);
                   const fmt = n => n.toFixed(4);
+                  const sellRows = [[sellLevels[2],'卖3','text-red-300'],[sellLevels[1],'卖2','text-red-400'],[sellLevels[0],'卖1','text-red-600 font-bold']];
+                  const buyRows  = [[buyLevels[0],'买1','text-emerald-600 font-bold'],[buyLevels[1],'买2','text-emerald-500'],[buyLevels[2],'买3','text-emerald-400']];
                   return (
                     <div className="p-3 space-y-2">
-                      {/* 卖出区 */}
                       <div className="text-[10px] font-semibold text-red-400 uppercase tracking-wider px-1 mb-1">卖出点位</div>
-                      {[[s3,sell3Shares,'卖3','text-red-300'],[s2,sell2Shares,'卖2','text-red-400'],[s1,sell1Shares,'卖1','text-red-600 font-bold']].map(([price,shares,label,cls])=>(
+                      {sellRows.map(([lv,label,cls])=>(
                         <div key={label} className="flex items-center justify-between px-3 py-2 bg-red-50 rounded-xl">
                           <span className={`text-xs ${cls==='text-red-600 font-bold'?'font-bold text-red-600':'text-red-400'}`}>{label}</span>
-                          <span className={`font-mono text-sm ${cls}`}>{fmt(price)}</span>
-                          <span className="text-xs text-slate-400 font-mono">{shares.toLocaleString()} 股</span>
+                          <span className={`font-mono text-sm ${cls}`}>{fmt(lv.price)}</span>
+                          <span className="text-xs text-slate-400 font-mono">{lv.shares.toLocaleString()} 股</span>
                         </div>
                       ))}
-                      {/* 当前价 */}
                       <div className="flex items-center justify-between px-3 py-2 bg-slate-50 rounded-xl border border-slate-200">
                         <span className="text-xs text-slate-500 font-medium">上次成交</span>
                         <span className="font-mono text-sm font-bold text-slate-700">{fmt(lastPrice)}</span>
                         <span className="text-xs text-indigo-400 font-mono">持仓 {totalShares.toLocaleString()}股</span>
                       </div>
-                      {/* 买入区 */}
                       <div className="text-[10px] font-semibold text-emerald-500 uppercase tracking-wider px-1 mt-2 mb-1">买入点位</div>
-                      {[[b1,buy1Shares,'买1','text-emerald-600 font-bold'],[b2,buy2Shares,'买2','text-emerald-500'],[b3,buy3Shares,'买3','text-emerald-400']].map(([price,shares,label,cls])=>(
+                      {buyRows.map(([lv,label,cls])=>(
                         <div key={label} className="flex items-center justify-between px-3 py-2 bg-emerald-50 rounded-xl">
                           <span className={`text-xs ${cls.includes('font-bold')?'font-bold text-emerald-600':'text-emerald-400'}`}>{label}</span>
-                          <span className={`font-mono text-sm ${cls}`}>{fmt(price)}</span>
-                          <span className="text-xs text-slate-400 font-mono">{shares.toLocaleString()} 股</span>
+                          <span className={`font-mono text-sm ${cls}`}>{fmt(lv.price)}</span>
+                          <span className="text-xs text-slate-400 font-mono">{lv.shares.toLocaleString()} 股</span>
                         </div>
                       ))}
                     </div>
@@ -2740,32 +2766,14 @@
                                   const lastPrice = lastTrade.price;
                                   const g = (config.gridSizePct || 5) / 100;
 
-                                  // 卖点（向上3档）
-                                  const s1 = lastPrice * (1 + g);
-                                  const s2 = s1 * (1 + g);
-                                  const s3 = s2 * (1 + g);
-                                  // 买点（向下3档）
-                                  const b1 = lastPrice * (1 - g);
-                                  const b2 = b1 * (1 - g);
-                                  const b3 = b2 * (1 - g);
-
-                                  // 卖出股数：按比例递进（卖1=持仓33%，卖2=再33%，卖3=剩余）
-                                  const sellShares1 = Math.round(totalShares * 0.33);
-                                  const sellShares2 = Math.round(totalShares * 0.33);
-                                  const sellShares3 = totalShares - sellShares1 - sellShares2;
-
-                                  // 买入股数：按配置 minBuy/maxBuy 计算（梯次加仓）
-                                  const buyAmt1 = config.minBuy || 1000;
-                                  const buyAmt2 = Math.round(((config.minBuy || 1000) + (config.maxBuy || 5000)) / 2);
-                                  const buyAmt3 = config.maxBuy || 5000;
-                                  const buyShares1 = b1 > 0 ? Math.round(buyAmt1 / b1) : 0;
-                                  const buyShares2 = b2 > 0 ? Math.round(buyAmt2 / b2) : 0;
-                                  const buyShares3 = b3 > 0 ? Math.round(buyAmt3 / b3) : 0;
+                                  // 使用统一计算函数（与完整网格计划一致）
+                                  const { sellLevels, buyLevels } = calcGridLevels(lastPrice, config, totalShares, 3);
+                                  const [s1d, s2d, s3d] = sellLevels;
+                                  const [b1d, b2d, b3d] = buyLevels;
 
                                   const fmtP = (n) => n.toFixed(4);
                                   const fmtS = (n) => n > 0 ? n.toLocaleString() : '—';
 
-                                  // 价格+股数 单元格组件
                                   const Cell = ({ price, shares, colorClass, boldPrice = false, bg = '' }) => (
                                     <td className={`px-3 py-3 text-center ${bg}`}>
                                       <div className={`font-mono ${boldPrice ? 'font-bold' : ''} ${colorClass} leading-tight`}>{fmtP(price)}</div>
@@ -2781,16 +2789,16 @@
                                         <div className="text-slate-400 font-mono text-[10px]">{config.fundCode}</div>
                                         <div className="text-[10px] text-indigo-400 mt-0.5">持仓 {totalShares.toLocaleString()}股</div>
                                       </td>
-                                      <Cell price={s3} shares={sellShares3} colorClass="text-red-300" />
-                                      <Cell price={s2} shares={sellShares2} colorClass="text-red-400" />
-                                      <Cell price={s1} shares={sellShares1} colorClass="text-red-600" boldPrice />
+                                      <Cell price={s3d.price} shares={s3d.shares} colorClass="text-red-300" />
+                                      <Cell price={s2d.price} shares={s2d.shares} colorClass="text-red-400" />
+                                      <Cell price={s1d.price} shares={s1d.shares} colorClass="text-red-600" boldPrice />
                                       <td className="px-3 py-3 text-center bg-slate-50">
                                         <div className="font-mono font-bold text-slate-600 leading-tight">{fmtP(lastPrice)}</div>
                                         <div className="text-[10px] text-slate-400 mt-0.5">成交价</div>
                                       </td>
-                                      <Cell price={b1} shares={buyShares1} colorClass="text-emerald-600" boldPrice />
-                                      <Cell price={b2} shares={buyShares2} colorClass="text-emerald-500" />
-                                      <Cell price={b3} shares={buyShares3} colorClass="text-emerald-400" />
+                                      <Cell price={b1d.price} shares={b1d.shares} colorClass="text-emerald-600" boldPrice />
+                                      <Cell price={b2d.price} shares={b2d.shares} colorClass="text-emerald-500" />
+                                      <Cell price={b3d.price} shares={b3d.shares} colorClass="text-emerald-400" />
                                       <td className="px-3 py-3 text-center">
                                         <div className="text-slate-400 font-mono">{config.gridSizePct}%</div>
                                       </td>
