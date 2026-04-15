@@ -190,21 +190,20 @@
       // 回收箱：存入被删资产的完整快照（manager条目 + config + records）
       async getTrash(userCode) {
         try {
-          const { data, error } = await supabase
-            .from('grid_trash')
-            .select('trash')
-            .eq('user_code', userCode)
-            .single();
-          if (error) return []; // 表不存在或无数据都返回空数组
-          return data ? data.trash : [];
-        } catch(e) { return []; }
+          // 优先读 localStorage
+          const local = localStorage.getItem(`grid_trash_${userCode}`);
+          if (local) return JSON.parse(local);
+        } catch(e) {}
+        return [];
       },
       async setTrash(userCode, trash) {
+        // 本地持久化
+        try { localStorage.setItem(`grid_trash_${userCode}`, JSON.stringify(trash)); } catch(e) {}
+        // 尝试 Supabase（表不存在时静默）
         try {
-          await supabase
-            .from('grid_trash')
+          await supabase.from('grid_trash')
             .upsert({ user_code: userCode, trash, updated_at: new Date().toISOString() }, { onConflict: 'user_code' });
-        } catch(e) { /* 表不存在时静默失败 */ }
+        } catch(e) {}
       }
     };
 
@@ -2168,19 +2167,27 @@
 
       const { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine, Area, ComposedChart, Brush } = Recharts;
 
-      // 从 Supabase 加载池子
+      // 从 localStorage 加载池子（不依赖 Supabase 额外建表）
       useEffect(() => {
-        (async () => {
-          try {
-            const { data } = await supabase.from('rotation_pool').select('pool').eq('user_code', userCode).single();
-            if (data?.pool) setPool(data.pool);
-          } catch(e) {}
-        })();
+        try {
+          const saved = localStorage.getItem(`rotation_pool_${userCode}`);
+          if (saved) setPool(JSON.parse(saved));
+        } catch(e) {}
       }, [userCode]);
 
       const savePool = async (newPool) => {
         setPool(newPool);
-        try { await supabase.from('rotation_pool').upsert({ user_code: userCode, pool: newPool, updated_at: new Date().toISOString() }, { onConflict: 'user_code' }); } catch(e) {}
+        // 本地持久化
+        try { localStorage.setItem(`rotation_pool_${userCode}`, JSON.stringify(newPool)); } catch(e) {}
+        // 同时尝试同步到 Supabase（表存在时生效，不存在时静默失败不报错）
+        try {
+          const { error } = await supabase.from('rotation_pool')
+            .upsert({ user_code: userCode, pool: newPool, updated_at: new Date().toISOString() }, { onConflict: 'user_code' });
+          // 只有非404错误才输出（404说明表未建，属于预期情况）
+          if (error && !error.message?.includes('relation') && error.code !== '42P01') {
+            console.warn('rotation_pool sync:', error.message);
+          }
+        } catch(e) {}
       };
 
       const addToPool = (code, name) => {
