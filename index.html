@@ -165,6 +165,22 @@
           .from('grid_records')
           .upsert({ user_code: userCode, asset_id: String(assetId), records, updated_at: new Date().toISOString() }, { onConflict: 'user_code,asset_id' });
         if (error) throw error;
+      },
+      // 回收箱：存入被删资产的完整快照（manager条目 + config + records）
+      async getTrash(userCode) {
+        const { data, error } = await supabase
+          .from('grid_trash')
+          .select('trash')
+          .eq('user_code', userCode)
+          .single();
+        if (error && error.code !== 'PGRST116') throw error;
+        return data ? data.trash : [];
+      },
+      async setTrash(userCode, trash) {
+        const { error } = await supabase
+          .from('grid_trash')
+          .upsert({ user_code: userCode, trash, updated_at: new Date().toISOString() }, { onConflict: 'user_code' });
+        if (error) throw error;
       }
     };
 
@@ -1646,23 +1662,23 @@
 
     // 轮动评分计算（纯计算，不依赖网络）
     const calcRotationScore = (data, weights) => {
-      if (!data || data.length < 20) return null;
+      if (!data || data.length < 26) return null;
       const prices = data.map(d => d.netValue);
       const vols = data.map(d => d.volume || 0);
       const n = prices.length;
 
-      // 动量：20日、60日涨幅
+      // ── 动量：20日、60日涨幅 ──────────────────────
       const mom20 = n >= 20 ? (prices[n-1] - prices[n-20]) / prices[n-20] * 100 : 0;
       const mom60 = n >= 60 ? (prices[n-1] - prices[n-60]) / prices[n-60] * 100 : 0;
       const momScore = (mom20 * 0.6 + mom60 * 0.4);
 
-      // 量能：近5日成交量 vs 近20日均量
+      // ── 量能：近5日成交量 vs 近20日均量 ──────────
       const recentVol = vols.slice(-5).reduce((a,b) => a+b, 0) / 5;
       const avgVol20 = vols.slice(-20).reduce((a,b) => a+b, 0) / 20;
       const volRatio = avgVol20 > 0 ? recentVol / avgVol20 : 1;
       const volScore = Math.min((volRatio - 1) * 50, 30);
 
-      // ATR波动率（近14日）
+      // ── ATR 波动率（近14日） ──────────────────────
       let atrSum = 0;
       for (let i = Math.max(1, n-14); i < n; i++) {
         atrSum += Math.abs(prices[i] - prices[i-1]);
@@ -1671,17 +1687,68 @@
       const atrPct = prices[n-1] > 0 ? atr / prices[n-1] * 100 : 0;
       const volPenalty = -atrPct * 5;
 
-      // 量价共振：价涨量增加分，价涨量缩扣分
+      // ── 量价共振 ──────────────────────────────────
       const priceUp = prices[n-1] > prices[n-6];
       const volUp = volRatio > 1.1;
       const resonance = priceUp && volUp ? 10 : priceUp && !volUp ? -8 : 0;
 
-      // 综合得分
-      const raw = momScore * weights.mom + volScore * weights.vol + volPenalty * weights.atr + resonance;
-      const score = Math.max(-100, Math.min(100, raw));
+      // ── RSI(14) ───────────────────────────────────
+      const calcRSI = (p, period = 14) => {
+        if (p.length < period + 1) return 50;
+        let gains = 0, losses = 0;
+        for (let i = p.length - period; i < p.length; i++) {
+          const diff = p[i] - p[i-1];
+          if (diff > 0) gains += diff; else losses += Math.abs(diff);
+        }
+        const avgGain = gains / period;
+        const avgLoss = losses / period;
+        if (avgLoss === 0) return 100;
+        const rs = avgGain / avgLoss;
+        return parseFloat((100 - 100 / (1 + rs)).toFixed(1));
+      };
+      const rsi = calcRSI(prices, 14);
+      // RSI 信号：50以上趋势偏多，70以上超买扣分，30以下超卖加分（逆向轮动机会）
+      const rsiSignal = rsi >= 70 ? 'overbought' : rsi <= 30 ? 'oversold' : rsi >= 50 ? 'bullish' : 'bearish';
+      const rsiBonus = rsi >= 50 && rsi < 70 ? 5 : rsi >= 70 ? -5 : rsi <= 30 ? 3 : -3;
 
-      // 近5日各价格
-      const recent5 = prices.slice(-5);
+      // ── MACD(12,26,9) ─────────────────────────────
+      const calcEMA = (p, period) => {
+        const k = 2 / (period + 1);
+        let ema = p[0];
+        for (let i = 1; i < p.length; i++) ema = p[i] * k + ema * (1 - k);
+        return ema;
+      };
+      const calcMACD = (p) => {
+        if (p.length < 35) return { macd: 0, signal: 0, hist: 0, trend: 'flat' };
+        // 用全部价格计算，避免窗口过短失真
+        const ema12 = calcEMA(p, 12);
+        const ema26 = calcEMA(p, 26);
+        const macdLine = ema12 - ema26;
+        // 用近34日计算9日信号线的EMA基础
+        const macdSeries = [];
+        for (let i = Math.max(26, p.length - 34); i < p.length; i++) {
+          const e12 = calcEMA(p.slice(0, i+1), 12);
+          const e26 = calcEMA(p.slice(0, i+1), 26);
+          macdSeries.push(e12 - e26);
+        }
+        const signalLine = calcEMA(macdSeries, 9);
+        const hist = macdLine - signalLine;
+        const prevHist = macdSeries.length >= 2 ? macdSeries[macdSeries.length-2] - calcEMA(macdSeries.slice(0,-1), 9) : 0;
+        const trend = hist > 0 && hist > prevHist ? 'golden' : hist > 0 ? 'bullish' : hist < 0 && hist < prevHist ? 'death' : 'bearish';
+        return {
+          macd: parseFloat(macdLine.toFixed(4)),
+          signal: parseFloat(signalLine.toFixed(4)),
+          hist: parseFloat(hist.toFixed(4)),
+          trend,
+        };
+      };
+      const macdResult = calcMACD(prices);
+      // MACD 加减分：金叉/多头加分，死叉/空头扣分
+      const macdBonus = macdResult.trend === 'golden' ? 8 : macdResult.trend === 'bullish' ? 4 : macdResult.trend === 'death' ? -8 : -4;
+
+      // ── 综合得分 ──────────────────────────────────
+      const raw = momScore * weights.mom + volScore * weights.vol + volPenalty * weights.atr + resonance + rsiBonus + macdBonus;
+      const score = Math.max(-100, Math.min(100, raw));
 
       return {
         score: parseFloat(score.toFixed(1)),
@@ -1690,9 +1757,11 @@
         volRatio: parseFloat(volRatio.toFixed(2)),
         atrPct: parseFloat(atrPct.toFixed(2)),
         resonance,
+        rsi,
+        rsiSignal,
+        macd: macdResult,
         signal: score >= 15 ? 'strong' : score >= 5 ? 'weak' : score >= -5 ? 'neutral' : score >= -15 ? 'caution' : 'danger',
         lastPrice: prices[n-1],
-        recent5,
         priceUp,
         volUp,
       };
@@ -2084,6 +2153,10 @@
                   <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
                     {scores.slice(0, 3).map((etf, idx) => {
                       const cfg = signalConfig[etf.signal || 'nodata'];
+                      const rsiColor = etf.rsiSignal === 'overbought' ? 'text-red-500 bg-red-50' : etf.rsiSignal === 'oversold' ? 'text-emerald-600 bg-emerald-50' : etf.rsiSignal === 'bullish' ? 'text-orange-500 bg-orange-50' : 'text-blue-500 bg-blue-50';
+                      const rsiLabel = etf.rsiSignal === 'overbought' ? '超买' : etf.rsiSignal === 'oversold' ? '超卖' : etf.rsiSignal === 'bullish' ? '偏多' : '偏空';
+                      const macdColor = etf.macd?.trend === 'golden' ? 'text-red-500 bg-red-50' : etf.macd?.trend === 'bullish' ? 'text-orange-500 bg-orange-50' : etf.macd?.trend === 'death' ? 'text-emerald-600 bg-emerald-50' : 'text-blue-500 bg-blue-50';
+                      const macdLabel = etf.macd?.trend === 'golden' ? '金叉↑' : etf.macd?.trend === 'bullish' ? '多头' : etf.macd?.trend === 'death' ? '死叉↓' : '空头';
                       return (
                         <Card key={etf.code} className={`p-5 border-2 ${idx === 0 ? 'border-violet-300 bg-violet-50/30' : 'border-slate-100'}`}>
                           <div className="flex justify-between items-start mb-2">
@@ -2098,12 +2171,25 @@
                             </div>
                           </div>
                           {etf.score != null && (
-                            <div className="grid grid-cols-2 gap-2 text-xs mt-3 pt-3 border-t border-slate-100">
-                              <div><span className="text-slate-400">20日</span> <span className={`font-bold ${etf.mom20 >= 0 ? 'text-red-500' : 'text-green-600'}`}>{etf.mom20 > 0 ? '+' : ''}{etf.mom20}%</span></div>
-                              <div><span className="text-slate-400">60日</span> <span className={`font-bold ${etf.mom60 >= 0 ? 'text-red-500' : 'text-green-600'}`}>{etf.mom60 > 0 ? '+' : ''}{etf.mom60}%</span></div>
-                              <div><span className="text-slate-400">量比</span> <span className={`font-bold ${etf.volRatio > 1 ? 'text-red-500' : 'text-slate-600'}`}>{etf.volRatio}x</span></div>
-                              <div><span className="text-slate-400">波动</span> <span className="font-bold text-slate-600">{etf.atrPct}%</span></div>
-                            </div>
+                            <>
+                              <div className="grid grid-cols-2 gap-2 text-xs mt-3 pt-3 border-t border-slate-100">
+                                <div><span className="text-slate-400">20日</span> <span className={`font-bold ${etf.mom20 >= 0 ? 'text-red-500' : 'text-green-600'}`}>{etf.mom20 > 0 ? '+' : ''}{etf.mom20}%</span></div>
+                                <div><span className="text-slate-400">60日</span> <span className={`font-bold ${etf.mom60 >= 0 ? 'text-red-500' : 'text-green-600'}`}>{etf.mom60 > 0 ? '+' : ''}{etf.mom60}%</span></div>
+                                <div><span className="text-slate-400">量比</span> <span className={`font-bold ${etf.volRatio > 1 ? 'text-red-500' : 'text-slate-600'}`}>{etf.volRatio}x</span></div>
+                                <div><span className="text-slate-400">波动</span> <span className="font-bold text-slate-600">{etf.atrPct}%</span></div>
+                              </div>
+                              {/* RSI + MACD 指标行 */}
+                              <div className="grid grid-cols-2 gap-2 mt-2">
+                                <div className={`rounded-lg px-2 py-1.5 flex items-center justify-between ${rsiColor.split(' ')[1]} border border-slate-100`}>
+                                  <span className="text-[10px] text-slate-500 font-medium">RSI(14)</span>
+                                  <span className={`text-xs font-bold ${rsiColor.split(' ')[0]}`}>{etf.rsi} <span className="text-[9px]">{rsiLabel}</span></span>
+                                </div>
+                                <div className={`rounded-lg px-2 py-1.5 flex items-center justify-between ${macdColor.split(' ')[1]} border border-slate-100`}>
+                                  <span className="text-[10px] text-slate-500 font-medium">MACD</span>
+                                  <span className={`text-xs font-bold ${macdColor.split(' ')[0]}`}>{macdLabel}</span>
+                                </div>
+                              </div>
+                            </>
                           )}
                           {etf.resonance > 0 && <div className="mt-2 text-[10px] px-2 py-1 bg-red-50 text-red-600 rounded font-bold">⚡ 量价共振！价涨量增</div>}
                           {etf.resonance < 0 && <div className="mt-2 text-[10px] px-2 py-1 bg-amber-50 text-amber-600 rounded">⚠ 价涨量缩，注意分歧</div>}
@@ -2116,7 +2202,7 @@
                   <Card className="overflow-hidden">
                     <div className="p-4 border-b bg-slate-50 flex justify-between items-center">
                       <span className="font-bold text-slate-700">全部 ETF 轮动评分排名</span>
-                      <span className="text-xs text-slate-400">数据越新越准，建议每日开盘后更新</span>
+                      <span className="text-xs text-slate-400">RSI/MACD 已纳入综合评分 · 建议每日开盘后更新</span>
                     </div>
                     <div className="overflow-x-auto">
                       <table className="w-full text-sm">
@@ -2126,10 +2212,11 @@
                             <th className="px-4 py-3 text-left">ETF</th>
                             <th className="px-4 py-3 text-center">信号</th>
                             <th className="px-4 py-3 text-right">综合分</th>
-                            <th className="px-4 py-3 text-right">20日涨幅</th>
-                            <th className="px-4 py-3 text-right">60日涨幅</th>
+                            <th className="px-4 py-3 text-right">20日</th>
+                            <th className="px-4 py-3 text-right">60日</th>
                             <th className="px-4 py-3 text-right">量比</th>
-                            <th className="px-4 py-3 text-right">波动率</th>
+                            <th className="px-4 py-3 text-right">RSI</th>
+                            <th className="px-4 py-3 text-center">MACD</th>
                             <th className="px-4 py-3 text-center">量价</th>
                             <th className="px-4 py-3 text-right">现价</th>
                           </tr>
@@ -2137,14 +2224,18 @@
                         <tbody className="divide-y divide-slate-100">
                           {scores.map((etf, idx) => {
                             const cfg = signalConfig[etf.signal || 'nodata'];
+                            const rsiColor = etf.rsiSignal === 'overbought' ? 'text-red-500' : etf.rsiSignal === 'oversold' ? 'text-emerald-600' : etf.rsiSignal === 'bullish' ? 'text-orange-500' : 'text-blue-400';
+                            const rsiLabel = etf.rsiSignal === 'overbought' ? '超买' : etf.rsiSignal === 'oversold' ? '超卖' : etf.rsiSignal === 'bullish' ? '偏多' : '偏空';
+                            const macdColor = etf.macd?.trend === 'golden' ? 'text-red-500 bg-red-50' : etf.macd?.trend === 'bullish' ? 'text-orange-400 bg-orange-50' : etf.macd?.trend === 'death' ? 'text-emerald-600 bg-emerald-50' : 'text-blue-400 bg-blue-50';
+                            const macdLabel = etf.macd?.trend === 'golden' ? '金叉↑' : etf.macd?.trend === 'bullish' ? '多头' : etf.macd?.trend === 'death' ? '死叉↓' : '空头';
                             return (
                               <tr key={etf.code} className={`hover:bg-slate-50 ${idx < holdCount ? 'bg-violet-50/30' : ''}`}>
-                                <td className="px-4 py-3 text-slate-400 font-mono">
+                                <td className="px-4 py-3 text-slate-400 font-mono text-xs">
                                   #{idx + 1}
                                   {idx < holdCount && <span className="ml-1 text-[10px] bg-violet-100 text-violet-600 px-1 rounded">持仓</span>}
                                 </td>
                                 <td className="px-4 py-3">
-                                  <div className="font-medium text-slate-800">{etfData[etf.code]?.name || etf.name}</div>
+                                  <div className="font-medium text-slate-800 text-sm">{etfData[etf.code]?.name || etf.name}</div>
                                   <div className="text-[10px] font-mono text-slate-400">{etf.code}</div>
                                 </td>
                                 <td className="px-4 py-3 text-center">
@@ -2162,13 +2253,23 @@
                                 <td className={`px-4 py-3 text-right text-xs font-mono ${etf.volRatio > 1.2 ? 'text-red-500' : etf.volRatio < 0.8 ? 'text-green-600' : 'text-slate-500'}`}>
                                   {etf.volRatio != null ? etf.volRatio + 'x' : '—'}
                                 </td>
-                                <td className="px-4 py-3 text-right text-xs font-mono text-slate-500">
-                                  {etf.atrPct != null ? etf.atrPct + '%' : '—'}
+                                <td className="px-4 py-3 text-right">
+                                  {etf.rsi != null ? (
+                                    <div className="flex flex-col items-end">
+                                      <span className={`text-xs font-bold ${rsiColor}`}>{etf.rsi}</span>
+                                      <span className={`text-[9px] ${rsiColor}`}>{rsiLabel}</span>
+                                    </div>
+                                  ) : <span className="text-slate-300">—</span>}
+                                </td>
+                                <td className="px-4 py-3 text-center">
+                                  {etf.macd ? (
+                                    <span className={`text-[10px] px-1.5 py-0.5 rounded font-bold ${macdColor}`}>{macdLabel}</span>
+                                  ) : <span className="text-slate-300">—</span>}
                                 </td>
                                 <td className="px-4 py-3 text-center text-sm">
                                   {etf.resonance > 0 ? <span title="价涨量增">⚡</span> : etf.resonance < 0 ? <span title="价涨量缩" className="opacity-50">⚠</span> : <span className="text-slate-200">—</span>}
                                 </td>
-                                <td className="px-4 py-3 text-right font-mono text-slate-700">
+                                <td className="px-4 py-3 text-right font-mono text-slate-700 text-xs">
                                   {etf.lastPrice != null ? etf.lastPrice.toFixed(3) : '—'}
                                 </td>
                               </tr>
@@ -2438,7 +2539,24 @@
       const handleDeleteAsset = async (e, id) => {
         e.stopPropagation();
         if (assetManager.assets.length <= 1) { alert("至少保留一个资产"); return; }
-        if (!confirm("确定删除该资产及其所有交易记录吗？")) return;
+        const asset = assetManager.assets.find(a => a.id === id);
+        if (!asset) return;
+        // 软删除：先读取该资产完整数据，存入回收箱，再从列表移除
+        try {
+          const [cfg, rec] = await Promise.all([
+            db.getConfig(userCode, id),
+            db.getRecords(userCode, id)
+          ]);
+          const existingTrash = await db.getTrash(userCode) || [];
+          const snapshot = {
+            trashId: Date.now(),
+            deletedAt: new Date().toISOString(),
+            asset,
+            config: cfg,
+            records: rec || [],
+          };
+          await db.setTrash(userCode, [snapshot, ...existingTrash].slice(0, 20)); // 最多保留20条
+        } catch(e) { console.error('回收箱写入失败', e); }
         const newAssets = assetManager.assets.filter(a => a.id !== id);
         await setAssetManager(prev => ({ assets: newAssets, activeId: prev.activeId === id ? newAssets[0].id : prev.activeId }));
       };
@@ -2449,6 +2567,46 @@
 
       const [showOverview, setShowOverview] = useState(false);
       const [overviewData, setOverviewData] = useState({});
+      const [showRotation, setShowRotation] = useState(false);
+      const [showTrash, setShowTrash] = useState(false);
+      const [trashItems, setTrashItems] = useState([]);
+      const [trashLoading, setTrashLoading] = useState(false);
+      const [restoringId, setRestoringId] = useState(null);
+
+      const openTrash = async () => {
+        setShowTrash(true);
+        setTrashLoading(true);
+        try {
+          const items = await db.getTrash(userCode) || [];
+          setTrashItems(items);
+        } catch(e) { setTrashItems([]); }
+        setTrashLoading(false);
+      };
+
+      const restoreAsset = async (snapshot) => {
+        setRestoringId(snapshot.trashId);
+        try {
+          // 恢复资产到列表（新 id 避免冲突）
+          const newId = Date.now();
+          const restoredAsset = { ...snapshot.asset, id: newId };
+          await setAssetManager(prev => ({ assets: [...prev.assets, restoredAsset], activeId: prev.activeId }));
+          // 恢复 config 和 records
+          if (snapshot.config) await db.setConfig(userCode, newId, snapshot.config);
+          if (snapshot.records?.length) await db.setRecords(userCode, newId, snapshot.records);
+          // 从回收箱移除
+          const newTrash = trashItems.filter(t => t.trashId !== snapshot.trashId);
+          await db.setTrash(userCode, newTrash);
+          setTrashItems(newTrash);
+          alert(`「${snapshot.asset.name}」已恢复，含 ${snapshot.records?.length || 0} 笔交易记录`);
+        } catch(e) { alert('恢复失败：' + e.message); }
+        setRestoringId(null);
+      };
+
+      const deleteFromTrash = async (trashId) => {
+        const newTrash = trashItems.filter(t => t.trashId !== trashId);
+        await db.setTrash(userCode, newTrash);
+        setTrashItems(newTrash);
+      };
       const [showRotation, setShowRotation] = useState(false);
 
       const loadOverviewData = async () => {
@@ -2497,6 +2655,10 @@
                 <button onClick={() => setShowRotation(r => !r)}
                   className={`text-xs flex items-center gap-1.5 px-3 py-1.5 rounded-lg border transition-colors font-medium ${showRotation ? 'bg-violet-600 text-white border-violet-600 shadow-sm shadow-violet-200' : 'text-violet-600 hover:bg-violet-50 border-violet-200'}`}>
                   <Icon name="Repeat" size={14} /> {showRotation ? '退出轮动' : '量能轮动'}
+                </button>
+                <button onClick={openTrash} title="回收箱"
+                  className="text-xs flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-slate-200 text-slate-500 hover:bg-slate-50 hover:border-slate-300 transition-colors">
+                  <Icon name="Trash2" size={13} /> <span className="hidden sm:inline">回收箱</span>
                 </button>
                 {assetManager.assets.length > 1 && !showRotation && (
                   <button onClick={loadOverviewData} className="text-xs text-indigo-600 hover:bg-indigo-50 flex items-center gap-1 px-3 py-1.5 rounded-lg border border-indigo-200 transition-colors font-medium">
@@ -2626,6 +2788,74 @@
                       </>
                     );
                   })()}
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* 回收箱弹窗 */}
+          {showTrash && (
+            <div className="fixed inset-0 bg-black/60 z-50 flex items-start justify-center p-4 overflow-y-auto">
+              <div className="bg-white rounded-2xl shadow-2xl w-full max-w-2xl my-8">
+                <div className="p-5 border-b flex justify-between items-center">
+                  <h2 className="text-lg font-bold text-slate-800 flex items-center gap-2">
+                    <Icon name="Trash2" size={18} className="text-slate-400" /> 资产回收箱
+                    <span className="text-xs font-normal text-slate-400 bg-slate-100 px-2 py-0.5 rounded-full">{trashItems.length} 条</span>
+                  </h2>
+                  <button onClick={() => setShowTrash(false)} className="text-slate-400 hover:text-slate-600 p-1"><Icon name="X" size={20} /></button>
+                </div>
+                <div className="p-5">
+                  {trashLoading ? (
+                    <div className="text-center py-12 text-slate-400"><Icon name="RefreshCw" size={24} className="animate-spin mx-auto mb-2" />加载中...</div>
+                  ) : trashItems.length === 0 ? (
+                    <div className="text-center py-16 text-slate-300">
+                      <Icon name="Trash2" size={48} className="mx-auto mb-3 opacity-30" />
+                      <p className="text-sm">回收箱为空</p>
+                      <p className="text-xs mt-1">删除资产时会自动备份到这里，可随时恢复</p>
+                    </div>
+                  ) : (
+                    <div className="space-y-3">
+                      <p className="text-xs text-slate-400 mb-3">最多保留最近 20 条删除记录，恢复后将以新资产形式加入列表，交易记录完整还原</p>
+                      {trashItems.map(snapshot => {
+                        const deletedDate = new Date(snapshot.deletedAt);
+                        const daysAgo = Math.floor((Date.now() - deletedDate) / (1000 * 60 * 60 * 24));
+                        return (
+                          <div key={snapshot.trashId} className="border border-slate-200 rounded-xl p-4 hover:border-slate-300 transition-colors">
+                            <div className="flex items-start justify-between gap-3">
+                              <div className="flex-1 min-w-0">
+                                <div className="flex items-center gap-2 mb-1">
+                                  <span className={`text-xs text-white px-1.5 py-0.5 rounded flex-shrink-0 ${snapshot.asset?.type === 'stock' ? 'bg-blue-500' : 'bg-orange-500'}`}>
+                                    {snapshot.asset?.type === 'stock' ? '股票' : '基金'}
+                                  </span>
+                                  <span className="font-bold text-slate-800 truncate">{snapshot.asset?.name || '未知资产'}</span>
+                                  <span className="text-xs text-slate-400 font-mono flex-shrink-0">{snapshot.asset?.code}</span>
+                                </div>
+                                <div className="flex items-center gap-4 text-xs text-slate-400 flex-wrap">
+                                  <span className="flex items-center gap-1"><Icon name="Calendar" size={11} /> 删除于 {deletedDate.toLocaleDateString('zh-CN')} ({daysAgo === 0 ? '今天' : `${daysAgo}天前`})</span>
+                                  <span className="flex items-center gap-1"><Icon name="FileSpreadsheet" size={11} /> {snapshot.records?.length || 0} 笔交易记录</span>
+                                  {snapshot.config && <span className="flex items-center gap-1"><Icon name="DollarSign" size={11} /> 本金 ¥{(snapshot.config.totalPrincipal || 0).toLocaleString()}</span>}
+                                </div>
+                              </div>
+                              <div className="flex items-center gap-2 flex-shrink-0">
+                                <button
+                                  onClick={() => restoreAsset(snapshot)}
+                                  disabled={restoringId === snapshot.trashId}
+                                  className="flex items-center gap-1.5 px-3 py-1.5 bg-indigo-600 text-white text-xs rounded-lg hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors font-medium">
+                                  {restoringId === snapshot.trashId ? <Icon name="RefreshCw" size={12} className="animate-spin" /> : <Icon name="Undo" size={12} />}
+                                  恢复
+                                </button>
+                                <button
+                                  onClick={() => { if (confirm('永久删除这条记录？此操作不可撤销')) deleteFromTrash(snapshot.trashId); }}
+                                  className="flex items-center gap-1 px-2 py-1.5 text-xs text-slate-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors">
+                                  <Icon name="Trash2" size={12} /> 彻底删除
+                                </button>
+                              </div>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
                 </div>
               </div>
             </div>
