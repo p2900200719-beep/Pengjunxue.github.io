@@ -2323,6 +2323,89 @@
         items: g.items.filter(item => !searchText || item.name.includes(searchText) || item.code.includes(searchText))
       })).filter(g => g.items.length > 0);
 
+      // ── 网格适合度评分函数（提到顶层，避免 Hook 规则违反）──
+      const calcGridScore = (data) => {
+        if (!data || data.length < 60) return null;
+        const prices = data.map(d => d.netValue);
+        const n = prices.length;
+        const slice60 = prices.slice(-60);
+        const mean60 = slice60.reduce((a,b) => a+b,0) / 60;
+        const std60 = Math.sqrt(slice60.reduce((s,p) => s + Math.pow(p - mean60, 2), 0) / 60);
+        const cvPct = mean60 > 0 ? (std60 / mean60 * 100) : 0;
+        const oscScore = cvPct < 1 ? 0 : cvPct < 3 ? 40 : cvPct < 8 ? 100 : cvPct < 12 ? 80 : cvPct < 18 ? 50 : 20;
+        const ma20 = [];
+        for (let i = 19; i < slice60.length; i++) {
+          ma20.push(slice60.slice(i-19, i+1).reduce((a,b)=>a+b,0)/20);
+        }
+        let crossCount = 0;
+        for (let i = 1; i < ma20.length; i++) {
+          const above = slice60[i+19] > ma20[i];
+          const prevAbove = slice60[i+18] > ma20[i-1];
+          if (above !== prevAbove) crossCount++;
+        }
+        const meanRevScore = Math.min(100, crossCount * 12);
+        const first20 = prices.slice(-60, -40);
+        const last20 = prices.slice(-20);
+        const trendPct = mean60 > 0 ? Math.abs((last20.reduce((a,b)=>a+b,0)/20 - first20.reduce((a,b)=>a+b,0)/20) / mean60 * 100) : 0;
+        const trendScore = trendPct < 3 ? 100 : trendPct < 8 ? 85 : trendPct < 15 ? 60 : trendPct < 25 ? 30 : 10;
+        const hi250 = Math.max(...prices.slice(-250));
+        const lo250 = Math.min(...prices.slice(-250));
+        const valPct = hi250 > lo250 ? ((prices[n-1] - lo250) / (hi250 - lo250) * 100) : 50;
+        const valScore = valPct < 20 ? 100 : valPct < 35 ? 90 : valPct < 50 ? 70 : valPct < 65 ? 45 : valPct < 80 ? 25 : 10;
+        const maxP = Math.max(...slice60);
+        const minP = Math.min(...slice60);
+        const rangeDropPct = maxP > 0 ? ((maxP - minP) / maxP * 100) : 0;
+        const rangeScore = rangeDropPct < 3 ? 20 : rangeDropPct < 8 ? 70 : rangeDropPct < 20 ? 100 : rangeDropPct < 30 ? 70 : 30;
+        const gridScore = Math.round(oscScore*0.25 + meanRevScore*0.25 + trendScore*0.20 + valScore*0.20 + rangeScore*0.10);
+        const suggestGridPct = cvPct < 3 ? 2 : cvPct < 6 ? 3 : cvPct < 10 ? 5 : cvPct < 15 ? 7 : 10;
+        const suggestSky = parseFloat((hi250 * 1.05).toFixed(4));
+        const suggestGround = parseFloat((lo250 * 0.95).toFixed(4));
+        const grade = gridScore >= 80 ? '极适合' : gridScore >= 65 ? '适合' : gridScore >= 50 ? '可以' : gridScore >= 35 ? '一般' : '不适合';
+        const gradeColor = gridScore >= 80 ? 'text-emerald-600' : gridScore >= 65 ? 'text-teal-600' : gridScore >= 50 ? 'text-amber-500' : gridScore >= 35 ? 'text-orange-500' : 'text-red-500';
+        const gradeBg = gridScore >= 80 ? 'bg-emerald-50 border-emerald-200' : gridScore >= 65 ? 'bg-teal-50 border-teal-200' : gridScore >= 50 ? 'bg-amber-50 border-amber-200' : gridScore >= 35 ? 'bg-orange-50 border-orange-200' : 'bg-red-50 border-red-200';
+        return {
+          gridScore, grade, gradeColor, gradeBg,
+          oscScore: Math.round(oscScore), meanRevScore: Math.round(meanRevScore),
+          trendScore: Math.round(trendScore), valScore: Math.round(valScore), rangeScore: Math.round(rangeScore),
+          cvPct: parseFloat(cvPct.toFixed(1)), crossCount,
+          trendPct: parseFloat(trendPct.toFixed(1)),
+          valPct: parseFloat(valPct.toFixed(1)),
+          rangeDropPct: parseFloat(rangeDropPct.toFixed(1)),
+          suggestGridPct, suggestSky, suggestGround,
+          currentPrice: prices[n-1],
+        };
+      };
+
+      // ── gridCandidates useMemo 提到顶层 ──────────────
+      const gridCandidates = useMemo(() => {
+        const results = [];
+        const allCodes = new Set([...pool.map(e => e.code), ...Object.keys(etfData)]);
+        allCodes.forEach(code => {
+          const d = etfData[code];
+          if (!d || d.data.length < 60) return;
+          const rotScore = calcRotationScore(d.data, weights);
+          const gs = calcGridScore(d.data);
+          if (!gs) return;
+          const rotBonus = rotScore ? (
+            rotScore.score >= 5 && rotScore.score <= 25 ? 20 :
+            rotScore.score > 25 ? 5 :
+            rotScore.score >= -10 ? 10 : -10
+          ) : 0;
+          const finalScore = Math.min(100, Math.max(0, gs.gridScore + rotBonus));
+          const etfInfo = pool.find(p => p.code === code) || { code, name: d.name };
+          results.push({
+            ...etfInfo, name: d.name || etfInfo.name, ...gs, finalScore,
+            rotScore: rotScore ? rotScore.score : null,
+            rsi: rotScore ? rotScore.rsi : null,
+            rsiSignal: rotScore ? rotScore.rsiSignal : null,
+            macdTrend: rotScore ? rotScore.macd?.trend : null,
+            mom20: rotScore ? rotScore.mom20 : null,
+          });
+        });
+        results.sort((a, b) => b.finalScore - a.finalScore);
+        return results;
+      }, [etfData, pool, weights]);
+
       return (
         <div>
           {/* 轮动子导航 */}
@@ -2922,126 +3005,6 @@
 
           {/* ===== 网格选标 Tab ===== */}
           {activeRotTab === 'gridpick' && (() => {
-            // ── 网格适合度评分引擎 ────────────────────────────────
-            const calcGridScore = (data) => {
-              if (!data || data.length < 60) return null;
-              const prices = data.map(d => d.netValue);
-              const n = prices.length;
-
-              // 1. 震荡系数：用近60日价格的标准差/均值（波动率），适中最好
-              const slice60 = prices.slice(-60);
-              const mean60 = slice60.reduce((a,b) => a+b,0) / 60;
-              const std60 = Math.sqrt(slice60.reduce((s,p) => s + Math.pow(p - mean60, 2), 0) / 60);
-              const cvPct = mean60 > 0 ? (std60 / mean60 * 100) : 0; // 变异系数 %
-              // 最佳网格区间：CV 在 3%~12%（太低无利润，太高风险大）
-              const oscScore = cvPct < 1 ? 0 : cvPct < 3 ? 40 : cvPct < 8 ? 100 : cvPct < 12 ? 80 : cvPct < 18 ? 50 : 20;
-
-              // 2. 均值回归性：近60日价格穿越MA20的次数（穿越越多越适合网格）
-              const ma20 = [];
-              for (let i = 19; i < slice60.length; i++) {
-                ma20.push(slice60.slice(i-19, i+1).reduce((a,b)=>a+b,0)/20);
-              }
-              let crossCount = 0;
-              for (let i = 1; i < ma20.length; i++) {
-                const above = slice60[i+19] > ma20[i];
-                const prevAbove = slice60[i+18] > ma20[i-1];
-                if (above !== prevAbove) crossCount++;
-              }
-              const meanRevScore = Math.min(100, crossCount * 12); // 每次穿越12分，上限100
-
-              // 3. 趋势强度（越弱越适合网格，强趋势适合持有不适合网格）
-              const first20 = prices.slice(-60, -40);
-              const last20 = prices.slice(-20);
-              const trendPct = mean60 > 0 ? Math.abs((last20.reduce((a,b)=>a+b,0)/20 - first20.reduce((a,b)=>a+b,0)/20) / mean60 * 100) : 0;
-              // 趋势越弱越好：<5% 满分，>20% 低分
-              const trendScore = trendPct < 3 ? 100 : trendPct < 8 ? 85 : trendPct < 15 ? 60 : trendPct < 25 ? 30 : 10;
-
-              // 4. 估值百分位（来自轮动模块已有计算）：低估值更适合建仓
-              const hi = Math.max(...prices.slice(-250));
-              const lo = Math.min(...prices.slice(-250));
-              const valPct = hi > lo ? ((prices[n-1] - lo) / (hi - lo) * 100) : 50;
-              // 低位建仓更安全：<30% 满分，>70% 低分
-              const valScore = valPct < 20 ? 100 : valPct < 35 ? 90 : valPct < 50 ? 70 : valPct < 65 ? 45 : valPct < 80 ? 25 : 10;
-
-              // 5. 最大区间跌幅（近60日）：跌幅适中说明有波动但不崩盘
-              const maxP = Math.max(...slice60);
-              const minP = Math.min(...slice60);
-              const rangeDropPct = maxP > 0 ? ((maxP - minP) / maxP * 100) : 0;
-              // 区间跌幅 5%~25% 最理想
-              const rangeScore = rangeDropPct < 3 ? 20 : rangeDropPct < 8 ? 70 : rangeDropPct < 20 ? 100 : rangeDropPct < 30 ? 70 : 30;
-
-              // 综合网格适合度（加权）
-              const gridScore = Math.round(
-                oscScore    * 0.25 +
-                meanRevScore* 0.25 +
-                trendScore  * 0.20 +
-                valScore    * 0.20 +
-                rangeScore  * 0.10
-              );
-
-              // 建议网格参数
-              const suggestGridPct = cvPct < 3 ? 2 : cvPct < 6 ? 3 : cvPct < 10 ? 5 : cvPct < 15 ? 7 : 10;
-              const suggestSky = parseFloat((hi * 1.05).toFixed(4));
-              const suggestGround = parseFloat((lo * 0.95).toFixed(4));
-
-              // 综合评级
-              const grade = gridScore >= 80 ? '极适合' : gridScore >= 65 ? '适合' : gridScore >= 50 ? '可以' : gridScore >= 35 ? '一般' : '不适合';
-              const gradeColor = gridScore >= 80 ? 'text-emerald-600' : gridScore >= 65 ? 'text-teal-600' : gridScore >= 50 ? 'text-amber-500' : gridScore >= 35 ? 'text-orange-500' : 'text-red-500';
-              const gradeBg = gridScore >= 80 ? 'bg-emerald-50 border-emerald-200' : gridScore >= 65 ? 'bg-teal-50 border-teal-200' : gridScore >= 50 ? 'bg-amber-50 border-amber-200' : gridScore >= 35 ? 'bg-orange-50 border-orange-200' : 'bg-red-50 border-red-200';
-
-              return {
-                gridScore, grade, gradeColor, gradeBg,
-                oscScore: Math.round(oscScore), meanRevScore: Math.round(meanRevScore),
-                trendScore: Math.round(trendScore), valScore: Math.round(valScore), rangeScore: Math.round(rangeScore),
-                cvPct: parseFloat(cvPct.toFixed(1)),
-                crossCount, trendPct: parseFloat(trendPct.toFixed(1)),
-                valPct: parseFloat(valPct.toFixed(1)),
-                rangeDropPct: parseFloat(rangeDropPct.toFixed(1)),
-                suggestGridPct, suggestSky, suggestGround,
-                currentPrice: prices[n-1],
-              };
-            };
-
-            // 对所有有数据的ETF计算网格评分
-            const gridCandidates = useMemo(() => {
-              const results = [];
-              // 先从池中取，再从已扫描的etfData取
-              const allCodes = new Set([
-                ...pool.map(e => e.code),
-                ...Object.keys(etfData),
-              ]);
-              allCodes.forEach(code => {
-                const d = etfData[code];
-                if (!d || d.data.length < 60) return;
-                const rotScore = calcRotationScore(d.data, weights);
-                const gridScore = calcGridScore(d.data);
-                if (!gridScore) return;
-                // 综合得分：网格适合度60% + 轮动动量方向40%（动量太强扣分，太弱也扣分）
-                // 理想是"温和偏多"而不是"极端强势"
-                const rotBonus = rotScore ? (
-                  rotScore.score >= 5 && rotScore.score <= 25 ? 20 :   // 温和偏多：最佳
-                  rotScore.score > 25 ? 5 :                              // 太强：可能追高
-                  rotScore.score >= -10 ? 10 :                           // 中性：还行
-                  -10                                                     // 弱势：不建议
-                ) : 0;
-                const finalScore = Math.min(100, Math.max(0, gridScore.gridScore + rotBonus));
-                const etfInfo = pool.find(p => p.code === code) || { code, name: d.name };
-                results.push({
-                  ...etfInfo,
-                  name: d.name || etfInfo.name,
-                  ...gridScore,
-                  finalScore,
-                  rotScore: rotScore ? rotScore.score : null,
-                  rsi: rotScore ? rotScore.rsi : null,
-                  rsiSignal: rotScore ? rotScore.rsiSignal : null,
-                  macdTrend: rotScore ? rotScore.macd?.trend : null,
-                  mom20: rotScore ? rotScore.mom20 : null,
-                });
-              });
-              results.sort((a, b) => b.finalScore - a.finalScore);
-              return results;
-            }, [etfData, pool, weights]);
-
             const hasData = gridCandidates.length > 0;
             const top = gridCandidates[0];
 
