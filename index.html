@@ -189,19 +189,22 @@
       },
       // 回收箱：存入被删资产的完整快照（manager条目 + config + records）
       async getTrash(userCode) {
-        const { data, error } = await supabase
-          .from('grid_trash')
-          .select('trash')
-          .eq('user_code', userCode)
-          .single();
-        if (error && error.code !== 'PGRST116') throw error;
-        return data ? data.trash : [];
+        try {
+          const { data, error } = await supabase
+            .from('grid_trash')
+            .select('trash')
+            .eq('user_code', userCode)
+            .single();
+          if (error) return []; // 表不存在或无数据都返回空数组
+          return data ? data.trash : [];
+        } catch(e) { return []; }
       },
       async setTrash(userCode, trash) {
-        const { error } = await supabase
-          .from('grid_trash')
-          .upsert({ user_code: userCode, trash, updated_at: new Date().toISOString() }, { onConflict: 'user_code' });
-        if (error) throw error;
+        try {
+          await supabase
+            .from('grid_trash')
+            .upsert({ user_code: userCode, trash, updated_at: new Date().toISOString() }, { onConflict: 'user_code' });
+        } catch(e) { /* 表不存在时静默失败 */ }
       }
     };
 
@@ -270,13 +273,11 @@
           } catch(_) {}
 
           const cbK = `cb_sk_${uid}`;
-          console.log(`[JSONP] 请求K线: secid=${secId}, cb=${cbK}`);
           const kRes = await jsonp(
-            `https://push2his.eastmoney.com/api/qt/stock/kline/get?cb=${cbK}&secid=${secId}&fields1=f1&fields2=f51,f53,f57,f58&klt=101&fqt=1&end=20500101&lmt=1500`,
+            `https://push2his.eastmoney.com/api/qt/stock/kline/get?cb=${cbK}&secid=${secId}&fields1=f1&fields2=f51,f53,f57,f58&klt=101&fqt=1&end=20500101&lmt=1000`,
             cbK
           );
 
-          console.log(`[JSONP] ${secId} 响应:`, kRes?.data?.klines?.length, '条');
           if (!kRes?.data?.klines?.length) throw new Error('empty');
 
           const data = kRes.data.klines.map(line => {
@@ -2182,17 +2183,14 @@
 
       const [fetchErrors, setFetchErrors] = useState({}); // code -> true 标记失败
 
-      // 拉取单只ETF数据（失败静默记录，不弹窗打断）
+      // 拉取单只ETF数据
       const fetchETF = async (code, name) => {
         setLoadingCodes(prev => ({ ...prev, [code]: true }));
         setFetchErrors(prev => { const n = {...prev}; delete n[code]; return n; });
         try {
-          console.log(`[轮动] 开始拉取 ${code}...`);
           const result = await fetchStockRealData(code);
-          console.log(`[轮动] ${code} 成功，数据条数: ${result.data.length}`);
           setEtfData(prev => ({ ...prev, [code]: { name: result.name || name, data: result.data } }));
         } catch(e) {
-          console.error(`[轮动] ${code} 失败:`, e);
           setFetchErrors(prev => ({ ...prev, [code]: true }));
         }
         setLoadingCodes(prev => ({ ...prev, [code]: false }));
