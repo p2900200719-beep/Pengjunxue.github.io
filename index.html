@@ -3767,9 +3767,106 @@
           {showOverview && (
             <div className="fixed inset-0 bg-black/60 z-50 flex items-start justify-center p-4 overflow-y-auto">
               <div className="bg-white rounded-2xl shadow-2xl w-full max-w-4xl my-8">
-                <div className="p-6 border-b flex justify-between items-center">
+                <div className="p-6 border-b flex justify-between items-center flex-wrap gap-3">
                   <h2 className="text-xl font-bold text-slate-800 flex items-center gap-2"><Icon name="PieChart" size={20} className="text-indigo-500" /> 多资产收益总览</h2>
-                  <button onClick={() => setShowOverview(false)} className="text-slate-400 hover:text-slate-600 p-1"><Icon name="X" size={20} /></button>
+                  <div className="flex items-center gap-2 flex-wrap">
+
+                    {/* 批量导入交易记录 */}
+                    <label className="text-xs flex items-center gap-1.5 px-3 py-1.5 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 transition-colors font-medium cursor-pointer">
+                      <Icon name="Upload" size={13} /> 批量导入交易记录
+                      <input type="file" accept=".csv" className="hidden" onChange={async (e) => {
+                        const file = e.target.files[0];
+                        if (!file) return;
+                        const text = await file.text();
+                        const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+                        if (lines.length < 2) { alert('文件内容为空'); return; }
+
+                        // 解析CSV，按标的代码分组
+                        const byCode = {};
+                        for (let i = 1; i < lines.length; i++) {
+                          const cols = lines[i].split(',').map(c => c.trim());
+                          if (cols.length < 5) continue;
+                          const code = cols[0], dateStr = cols[2], typeStr = cols[3].toLowerCase();
+                          const price = parseFloat(cols[4]), shares = parseFloat(cols[5]);
+                          if (!code || !dateStr || isNaN(price) || isNaN(shares)) continue;
+                          const type = (typeStr === 'sell' || typeStr === '卖出') ? 'sell' : 'buy';
+                          const amount = parseFloat((price * shares).toFixed(2));
+                          if (!byCode[code]) byCode[code] = [];
+                          byCode[code].push({ id: Date.now() + i, date: safeParseDate(dateStr), type, price, amount, shares });
+                        }
+
+                        // 按代码匹配资产，写入records
+                        const codes = Object.keys(byCode);
+                        if (codes.length === 0) { alert('未解析到有效记录，请检查文件格式'); return; }
+
+                        let matched = 0, unmatched = [];
+                        for (const code of codes) {
+                          // 在已有资产里找匹配的代码
+                          const asset = assetManager.assets.find(a => a.code === code);
+                          if (!asset) { unmatched.push(code); continue; }
+
+                          try {
+                            const existingRecords = await db.getRecords(userCode, asset.id) || [];
+                            const newRecs = byCode[code];
+                            // 去重：同日期同类型同价格不重复导入
+                            const deduped = newRecs.filter(nr =>
+                              !existingRecords.some(er =>
+                                er.date.split('T')[0] === nr.date.split('T')[0] &&
+                                er.type === nr.type &&
+                                Math.abs(er.price - nr.price) < 0.0001
+                              )
+                            );
+                            if (deduped.length > 0) {
+                              await db.setRecords(userCode, asset.id, [...deduped, ...existingRecords]);
+                              matched++;
+                            }
+                          } catch(err) { unmatched.push(code); }
+                        }
+
+                        // 重新加载总览数据
+                        await loadOverviewData();
+                        e.target.value = '';
+
+                        let msg = `✅ 成功导入 ${matched} 个标的的交易记录`;
+                        if (unmatched.length > 0) msg += `\n⚠️ 以下代码未找到对应资产：${unmatched.join(', ')}`;
+                        alert(msg);
+                      }} />
+                    </label>
+
+                    {/* 下载批量导入模板 */}
+                    <button onClick={() => {
+                      const csv = '\uFEFF标的代码,标的名称,日期(YYYY-MM-DD),类型(buy/sell),单价,份额\n510300,沪深300ETF,2026-01-15,buy,3.5000,1000\n510300,沪深300ETF,2026-02-20,sell,3.7000,500\n';
+                      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+                      const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
+                      a.download = '批量导入模板.csv'; a.click();
+                    }} className="text-xs flex items-center gap-1 px-2 py-1.5 border border-slate-200 text-slate-500 rounded-lg hover:bg-slate-50 transition-colors">
+                      <Icon name="FileSpreadsheet" size={13} /> 下载模板
+                    </button>
+
+                    {/* 导出网格点位 */}
+                    <button onClick={() => {
+                      const allAssets = Object.values(overviewData);
+                      let csv = '\uFEFF标的名称,代码,网格%,上次成交价,上次操作,买-1档价,买-1金额,买-1份数,买-2档价,买-2金额,买-2份数,买-3档价,买-3金额,买-3份数,卖+1档价,卖+1金额,卖+1份数,卖+2档价,卖+2金额,卖+2份数,卖+3档价,卖+3金额,卖+3份数\n';
+                      allAssets.forEach(({ asset, config, records }) => {
+                        if (!config || !records.length) return;
+                        const lastRec = [...records].sort((a,b) => new Date(b.date)-new Date(a.date))[0];
+                        if (!lastRec) return;
+                        const lp = lastRec.price, gp = (config.gridSizePct||5)/100;
+                        const minB = config.minBuy||1000, maxB = config.maxBuy||5000;
+                        const sky = config.skyLine||99999, gnd = config.groundLine||0;
+                        const totalShares = records.filter(r=>r.type==='buy').reduce((s,r)=>s+r.shares,0) - records.filter(r=>r.type==='sell').reduce((s,r)=>s+r.shares,0);
+                        const buyL = [1,2,3].map(i => { const p=parseFloat((lp*Math.pow(1-gp,i)).toFixed(4)); const r=sky>gnd?Math.max(0,Math.min(1,(sky-p)/(sky-gnd))):0.5; const a=Math.round(minB+r*(maxB-minB)); return [p,a,p>0?Math.round(a/p):0]; });
+                        const sellL = [1,2,3].map(i => { const p=parseFloat((lp*Math.pow(1+gp,i)).toFixed(4)); const s=Math.max(0,Math.round(totalShares*(i===1?0.25:i===2?0.35:0.4))); return [p,Math.round(s*p),s]; });
+                        csv += [asset.name,config.fundCode,config.gridSizePct,lp,lastRec.type==='buy'?'买入':'卖出',...buyL.flat(),...sellL.flat()].join(',') + '\n';
+                      });
+                      const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([csv],{type:'text/csv;charset=utf-8;'}));
+                      a.download = `网格点位速查_${new Date().toLocaleDateString()}.csv`; a.click();
+                    }} className="text-xs flex items-center gap-1.5 px-3 py-1.5 bg-emerald-600 text-white rounded-lg hover:bg-emerald-700 transition-colors font-medium">
+                      <Icon name="Download" size={13} /> 导出点位表
+                    </button>
+
+                    <button onClick={() => setShowOverview(false)} className="text-slate-400 hover:text-slate-600 p-1"><Icon name="X" size={20} /></button>
+                  </div>
                 </div>
 
                 <div className="p-6 space-y-6">
