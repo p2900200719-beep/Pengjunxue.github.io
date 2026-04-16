@@ -698,39 +698,92 @@
       const runOptimization = () => {
         if (marketData.length < 30) { alert("历史数据不足，请先更新数据"); return; }
         setIsOptimizing(true); setShowBacktestChart(true); setShowAllResults(false);
-        let backtestData = [];
-        if (backtestRange === 'custom') {
-          if (!customDateRange.start) { alert("请选择开始日期"); setIsOptimizing(false); return; }
-          const startDate = new Date(customDateRange.start), endDate = customDateRange.end ? new Date(customDateRange.end) : new Date();
-          backtestData = marketData.filter(d => { const dDate = new Date(d.date); return dDate >= startDate && dDate <= endDate; });
-        } else {
-          const now = new Date(); const startDate = new Date(); startDate.setFullYear(now.getFullYear() - (backtestRange === '1y' ? 1 : backtestRange === '2y' ? 2 : 3));
-          backtestData = marketData.filter(d => new Date(d.date) >= startDate);
-        }
-        if (backtestData.length < 10) { alert("所选时间段内数据不足，无法回测"); setIsOptimizing(false); return; }
+
+        // 获取回测数据（支持稳健模式同时跑多时间段）
+        const getBacktestData = (range) => {
+          if (range === 'custom') {
+            if (!customDateRange.start) return null;
+            const s = new Date(customDateRange.start), e = customDateRange.end ? new Date(customDateRange.end) : new Date();
+            return marketData.filter(d => { const dd = new Date(d.date); return dd >= s && dd <= e; });
+          }
+          const now = new Date(); const start = new Date();
+          start.setFullYear(now.getFullYear() - (range === '1y' ? 1 : range === '2y' ? 2 : 3));
+          return marketData.filter(d => new Date(d.date) >= start);
+        };
+
+        const backtestData = getBacktestData(backtestRange === 'steady' ? '3y' : backtestRange);
+        if (!backtestData || backtestData.length < 10) { alert("所选时间段内数据不足，无法回测"); setIsOptimizing(false); return; }
+
         const prices = backtestData.map(d => d.netValue);
         const backtestSkyLine = parseFloat((Math.max(...prices) * 1.1).toFixed(4));
         const backtestGroundLine = parseFloat((Math.min(...prices) * 0.9).toFixed(4));
         const buyHoldRoi = ((prices[prices.length - 1] - prices[0]) / prices[0] * 100).toFixed(2);
         const buyHoldProfit = config.totalPrincipal * (parseFloat(buyHoldRoi) / 100);
+
+        // 参数空间：19网格 × 10倍数 × 5底仓 = 950种
         const gridSizes = []; for (let g = 1.0; g <= 10.0; g += 0.5) gridSizes.push(parseFloat(g.toFixed(1)));
         const buyMultipliers = [1,2,3,4,5,6,7,8,9,10];
+        const initPcts = [10, 15, 20, 25, 30]; // 底仓比例5档
         const baseMinBuy = Math.round(config.totalPrincipal * 0.01);
+
         setTimeout(() => {
+          // 稳健模式：同时跑3个时间段
+          const data1y = getBacktestData('1y') || [];
+          const data2y = getBacktestData('2y') || [];
+          const data3y = getBacktestData('3y') || [];
+
           let allSimulations = [];
-          gridSizes.forEach(gridPct => { buyMultipliers.forEach(multiplier => { const sim = simulateStrategy(backtestData, gridPct, baseMinBuy, baseMinBuy * multiplier, backtestSkyLine, backtestGroundLine, config.totalPrincipal, config.initialPositionPct, config.idleInterestRate); allSimulations.push({ gridSize: gridPct, multiplier, minBuy: baseMinBuy, maxBuy: baseMinBuy * multiplier, profit: sim.profit, roi: (sim.profit / config.totalPrincipal * 100).toFixed(2), stats: sim.stats, trades: sim.trades, dailyHistory: sim.dailyHistory, excessRoi: ((sim.profit / config.totalPrincipal * 100) - parseFloat(buyHoldRoi)).toFixed(2) }); }); });
-          allSimulations.sort((a, b) => b.profit - a.profit);
+          gridSizes.forEach(gridPct => {
+            buyMultipliers.forEach(multiplier => {
+              initPcts.forEach(initPct => {
+                const sim = simulateStrategy(backtestData, gridPct, baseMinBuy, baseMinBuy * multiplier, backtestSkyLine, backtestGroundLine, config.totalPrincipal, initPct, config.idleInterestRate);
+                const roi = (sim.profit / config.totalPrincipal * 100).toFixed(2);
+
+                let steadyScore = null;
+                if (backtestRange === 'steady' && data1y.length >= 10 && data2y.length >= 10 && data3y.length >= 10) {
+                  const sky1 = parseFloat((Math.max(...data1y.map(d=>d.netValue)) * 1.1).toFixed(4));
+                  const gnd1 = parseFloat((Math.min(...data1y.map(d=>d.netValue)) * 0.9).toFixed(4));
+                  const sky2 = parseFloat((Math.max(...data2y.map(d=>d.netValue)) * 1.1).toFixed(4));
+                  const gnd2 = parseFloat((Math.min(...data2y.map(d=>d.netValue)) * 0.9).toFixed(4));
+                  const sky3 = parseFloat((Math.max(...data3y.map(d=>d.netValue)) * 1.1).toFixed(4));
+                  const gnd3 = parseFloat((Math.min(...data3y.map(d=>d.netValue)) * 0.9).toFixed(4));
+                  const r1 = simulateStrategy(data1y, gridPct, baseMinBuy, baseMinBuy*multiplier, sky1, gnd1, config.totalPrincipal, initPct, config.idleInterestRate);
+                  const r2 = simulateStrategy(data2y, gridPct, baseMinBuy, baseMinBuy*multiplier, sky2, gnd2, config.totalPrincipal, initPct, config.idleInterestRate);
+                  const r3 = simulateStrategy(data3y, gridPct, baseMinBuy, baseMinBuy*multiplier, sky3, gnd3, config.totalPrincipal, initPct, config.idleInterestRate);
+                  const roi1 = r1.profit / config.totalPrincipal * 100;
+                  const roi2 = r2.profit / config.totalPrincipal * 100;
+                  const roi3 = r3.profit / config.totalPrincipal * 100;
+                  // 按5:3:2加权
+                  steadyScore = roi1 * 0.5 + roi2 * 0.3 + roi3 * 0.2;
+                  allSimulations.push({ gridSize: gridPct, multiplier, initPct, minBuy: baseMinBuy, maxBuy: baseMinBuy*multiplier, profit: sim.profit, roi, stats: sim.stats, trades: sim.trades, dailyHistory: sim.dailyHistory, excessRoi: ((sim.profit/config.totalPrincipal*100) - parseFloat(buyHoldRoi)).toFixed(2), steadyScore: steadyScore.toFixed(2), roi1y: roi1.toFixed(2), roi2y: roi2.toFixed(2), roi3y: roi3.toFixed(2) });
+                } else {
+                  allSimulations.push({ gridSize: gridPct, multiplier, initPct, minBuy: baseMinBuy, maxBuy: baseMinBuy*multiplier, profit: sim.profit, roi, stats: sim.stats, trades: sim.trades, dailyHistory: sim.dailyHistory, excessRoi: ((sim.profit/config.totalPrincipal*100) - parseFloat(buyHoldRoi)).toFixed(2) });
+                }
+              });
+            });
+          });
+
+          // 排序：稳健模式按steadyScore，其他按profit
+          if (backtestRange === 'steady') {
+            allSimulations.sort((a, b) => parseFloat(b.steadyScore) - parseFloat(a.steadyScore));
+          } else {
+            allSimulations.sort((a, b) => b.profit - a.profit);
+          }
+
           const bestResult = allSimulations[0];
           const avgBuyAmt = Math.round((bestResult.minBuy + bestResult.maxBuy) / 2);
-          const standardSim = simulateStrategy(backtestData, bestResult.gridSize, avgBuyAmt, avgBuyAmt, backtestSkyLine, backtestGroundLine, config.totalPrincipal, config.initialPositionPct, config.idleInterestRate);
-          setOptimizationResult({ ...bestResult, autoSkyLine: backtestSkyLine, autoGroundLine: backtestGroundLine, buyHoldRoi, buyHoldProfit, standardGridResult: { profit: standardSim.profit, roi: (standardSim.profit / config.totalPrincipal * 100).toFixed(2), stats: standardSim.stats, fixedAmount: avgBuyAmt }, allResults: allSimulations });
+          const standardSim = simulateStrategy(backtestData, bestResult.gridSize, avgBuyAmt, avgBuyAmt, backtestSkyLine, backtestGroundLine, config.totalPrincipal, bestResult.initPct, config.idleInterestRate);
+          setOptimizationResult({ ...bestResult, autoSkyLine: backtestSkyLine, autoGroundLine: backtestGroundLine, buyHoldRoi, buyHoldProfit, standardGridResult: { profit: standardSim.profit, roi: (standardSim.profit/config.totalPrincipal*100).toFixed(2), stats: standardSim.stats, fixedAmount: avgBuyAmt }, allResults: allSimulations });
           setIsOptimizing(false);
         }, 100);
       };
 
       const applyOptimization = () => {
         if (isSettingsLocked) { alert("当前参数处于锁定状态，请先解锁。"); return; }
-        if (optimizationResult) { setConfig(prev => ({ ...prev, gridSizePct: optimizationResult.gridSize, minBuy: optimizationResult.minBuy, maxBuy: optimizationResult.maxBuy })); alert(`已应用最佳策略参数`); }
+        if (optimizationResult) {
+          setConfig(prev => ({ ...prev, gridSizePct: optimizationResult.gridSize, minBuy: optimizationResult.minBuy, maxBuy: optimizationResult.maxBuy, initialPositionPct: optimizationResult.initPct || prev.initialPositionPct }));
+          alert(`已应用最佳策略参数（网格${optimizationResult.gridSize}%，底仓${optimizationResult.initPct}%）`);
+        }
       };
 
       const handleTrade = (type) => {
@@ -932,6 +985,55 @@
                     <div className="flex justify-between"><span>当前持仓份额</span><span className="font-mono">{stats.totalShares.toFixed(0)}份</span></div>
                     <div className="flex justify-between"><span>已投入成本</span><span className="font-mono">{stats.currentInvested.toLocaleString()}</span></div>
                   </div>
+
+                  {/* 跌到地线前风险回测 */}
+                  {(() => {
+                    const curPrice = parseFloat(currentNetValue);
+                    if (!curPrice || !config.groundLine || curPrice <= config.groundLine || !nextActionAnalysis || nextActionAnalysis.actionType === 'init') return null;
+                    const gnd = config.groundLine;
+                    const gridPct = config.gridSizePct / 100;
+                    const lastPrice = nextActionAnalysis.lastPrice || curPrice;
+                    // 模拟从当前价一路跌到地线的买入情况
+                    let simPrice = lastPrice * (1 - gridPct); // 下一个买点
+                    let simShares = stats.totalShares;
+                    let simCash = stats.remainingPrincipal;
+                    let buyCount = 0, totalNeedCash = 0;
+                    const buySteps = [];
+                    while (simPrice > gnd && buyCount < 50) {
+                      const ratio = (config.skyLine - simPrice) / (config.skyLine - gnd);
+                      const buyAmt = Math.round(config.minBuy + Math.max(0, Math.min(1, ratio)) * (config.maxBuy - config.minBuy));
+                      const buyShares = simPrice > 0 ? buyAmt / simPrice : 0;
+                      simShares += buyShares;
+                      totalNeedCash += buyAmt;
+                      simCash -= buyAmt;
+                      buyCount++;
+                      buySteps.push({ price: simPrice, amt: buyAmt });
+                      simPrice = simPrice * (1 - gridPct);
+                    }
+                    const totalSharesAtGnd = simShares;
+                    const totalCostAtGnd = stats.currentInvested + totalNeedCash;
+                    const avgCostAtGnd = totalSharesAtGnd > 0 ? totalCostAtGnd / totalSharesAtGnd : 0;
+                    const canAfford = totalNeedCash <= stats.remainingPrincipal;
+                    const shortage = totalNeedCash - stats.remainingPrincipal;
+                    return (
+                      <div className="mt-3 border-t border-slate-200 pt-3">
+                        <div className="text-xs font-bold text-slate-600 mb-2 flex items-center gap-1">
+                          <Icon name="Flag" size={12} className="text-orange-500" /> 跌到地线前风险回测
+                        </div>
+                        <div className="space-y-1.5 text-xs">
+                          <div className="flex justify-between"><span className="text-slate-500">跌到地线前还需买入</span><span className="font-bold text-slate-700">{buyCount} 笔</span></div>
+                          <div className="flex justify-between"><span className="text-slate-500">跌到地线前还需买入金额</span><span className="font-bold text-slate-700">¥{totalNeedCash.toLocaleString(undefined,{maximumFractionDigits:0})}</span></div>
+                          <div className={`flex justify-between font-bold ${canAfford ? 'text-emerald-600' : 'text-red-500'}`}>
+                            <span>剩余本金{canAfford ? '充足' : '不足'}</span>
+                            <span>{canAfford ? `还剩 ¥${(stats.remainingPrincipal - totalNeedCash).toLocaleString(undefined,{maximumFractionDigits:0})}` : `还差 ¥${shortage.toLocaleString(undefined,{maximumFractionDigits:0})}`}</span>
+                          </div>
+                          <div className="h-px bg-slate-100"></div>
+                          <div className="flex justify-between"><span className="text-slate-500">到地线时总持仓</span><span className="font-mono text-slate-700">{totalSharesAtGnd.toFixed(0)} 份</span></div>
+                          <div className="flex justify-between"><span className="text-slate-500">到地线时持仓总成本</span><span className="font-mono text-slate-700">¥{totalCostAtGnd.toLocaleString(undefined,{maximumFractionDigits:0})}</span></div>
+                        </div>
+                      </div>
+                    );
+                  })()}
                 </Card>
               </div>
 
@@ -1504,7 +1606,7 @@
                     <div>
                       <label className="text-sm font-medium text-slate-600 mb-1 block">选择回测数据范围</label>
                       <div className="flex gap-2 mb-2">
-                        {['1y', '2y', '3y', 'custom'].map(r => (<button key={r} onClick={() => setBacktestRange(r)} className={`flex-1 py-1.5 text-xs rounded border transition-all ${backtestRange === r ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white text-slate-600 border-slate-300 hover:border-indigo-400'}`}>{r === '1y' ? '近1年' : r === '2y' ? '近2年' : r === '3y' ? '近3年' : '手动'}</button>))}
+                        {['1y', '2y', '3y', 'steady', 'custom'].map(r => (<button key={r} onClick={() => setBacktestRange(r)} className={`flex-1 py-1.5 text-xs rounded border transition-all ${backtestRange === r ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white text-slate-600 border-slate-300 hover:border-indigo-400'}`}>{r === '1y' ? '近1年' : r === '2y' ? '近2年' : r === '3y' ? '近3年' : r === 'steady' ? '稳健' : '手动'}</button>))}
                       </div>
                       {backtestRange === 'custom' && (
                         <div className="flex gap-2 items-center">
@@ -1514,18 +1616,40 @@
                         </div>
                       )}
                     </div>
-                    <Button onClick={runOptimization} disabled={isOptimizing} className="w-full py-3 text-base shadow-lg shadow-indigo-200">{isOptimizing ? '正在进行 190 种策略组合回测...' : '开始寻找最佳方案'}</Button>
+                    <Button onClick={runOptimization} disabled={isOptimizing} className="w-full py-3 text-base shadow-lg shadow-indigo-200">{isOptimizing ? `正在进行 950 种策略组合回测${backtestRange === 'steady' ? '（稳健模式×3）' : ''}...` : `开始寻找最佳方案（${backtestRange === 'steady' ? '稳健模式·950种×3段' : '950种方案遍历'}）`}</Button>
                   </div>
 
                   {optimizationResult && (
                     <div className="flex-1 overflow-y-auto space-y-4">
                       <div className="bg-white p-4 rounded-xl border border-indigo-100 shadow-sm text-center">
-                        <div className="text-sm text-slate-500 mb-1">最佳方案总收益率</div>
-                        <div className="text-3xl font-bold text-emerald-600">+{optimizationResult.roi}%</div>
-                        <div className="grid grid-cols-2 gap-2 mt-3 pt-3 border-t border-slate-100 text-xs">
-                          <div><div className="text-slate-400">总盈利</div><div className="font-bold text-slate-700">¥{Math.round(optimizationResult.profit).toLocaleString()}</div></div>
-                          <div><div className="text-slate-400">理财收益</div><div className="font-bold text-amber-600">¥{Math.round(optimizationResult.stats.totalIdleProfit).toLocaleString()}</div></div>
+                        <div className="text-sm text-slate-500 mb-1">
+                          {backtestRange === 'steady' ? '稳健模式综合收益率（5:3:2加权）' : '最佳方案总收益率'}
                         </div>
+                        <div className="text-3xl font-bold text-emerald-600">
+                          +{backtestRange === 'steady' ? optimizationResult.steadyScore : optimizationResult.roi}%
+                        </div>
+                        {backtestRange === 'steady' && optimizationResult.roi1y && (
+                          <div className="grid grid-cols-3 gap-2 mt-3 pt-3 border-t border-slate-100 text-xs">
+                            <div className="bg-slate-50 rounded p-2">
+                              <div className="text-slate-400 mb-0.5">近1年 <span className="text-indigo-400">×50%</span></div>
+                              <div className={`font-bold ${parseFloat(optimizationResult.roi1y)>=0?'text-red-500':'text-green-600'}`}>{optimizationResult.roi1y}%</div>
+                            </div>
+                            <div className="bg-slate-50 rounded p-2">
+                              <div className="text-slate-400 mb-0.5">近2年 <span className="text-indigo-400">×30%</span></div>
+                              <div className={`font-bold ${parseFloat(optimizationResult.roi2y)>=0?'text-red-500':'text-green-600'}`}>{optimizationResult.roi2y}%</div>
+                            </div>
+                            <div className="bg-slate-50 rounded p-2">
+                              <div className="text-slate-400 mb-0.5">近3年 <span className="text-indigo-400">×20%</span></div>
+                              <div className={`font-bold ${parseFloat(optimizationResult.roi)>=0?'text-red-500':'text-green-600'}`}>{optimizationResult.roi}%</div>
+                            </div>
+                          </div>
+                        )}
+                        {backtestRange !== 'steady' && (
+                          <div className="grid grid-cols-2 gap-2 mt-3 pt-3 border-t border-slate-100 text-xs">
+                            <div><div className="text-slate-400">总盈利</div><div className="font-bold text-slate-700">¥{Math.round(optimizationResult.profit).toLocaleString()}</div></div>
+                            <div><div className="text-slate-400">理财收益</div><div className="font-bold text-amber-600">¥{Math.round(optimizationResult.stats.totalIdleProfit).toLocaleString()}</div></div>
+                          </div>
+                        )}
                       </div>
 
                       <div className="bg-indigo-50 p-3 rounded-lg border border-indigo-100 text-xs space-y-2">
@@ -1551,6 +1675,14 @@
                       <div className="grid grid-cols-2 gap-3 text-xs">
                         <div className="bg-white p-3 rounded border border-slate-100"><div className="text-slate-400 mb-1">最佳网格</div><div className="font-bold text-indigo-600 text-lg">{optimizationResult.gridSize}%</div></div>
                         <div className="bg-white p-3 rounded border border-slate-100"><div className="text-slate-400 mb-1">买入倍数 (1:{optimizationResult.multiplier})</div><div className="font-bold text-slate-700 text-[10px]">¥{optimizationResult.minBuy} - ¥{optimizationResult.maxBuy}</div></div>
+                        <div className="bg-amber-50 p-3 rounded border border-amber-200 border-l-4 border-l-amber-400">
+                          <div className="text-amber-600 mb-1 font-medium">最优底仓比例</div>
+                          <div className="font-bold text-amber-700 text-lg">{optimizationResult.initPct}%</div>
+                        </div>
+                        <div className="bg-white p-3 rounded border border-slate-100">
+                          <div className="text-slate-400 mb-1">起始相对位置</div>
+                          <div className="font-bold text-slate-700">{optimizationResult.autoSkyLine > optimizationResult.autoGroundLine ? ((optimizationResult.autoSkyLine - (optimizationResult.dailyHistory?.[0]?.netValue||0)) / (optimizationResult.autoSkyLine - optimizationResult.autoGroundLine) * 100).toFixed(1) : '—'}%</div>
+                        </div>
                         <div className="bg-white p-3 rounded border border-slate-100 border-l-4 border-l-emerald-400"><div className="text-slate-400 mb-1">回测地线</div><div className="font-bold text-emerald-600 text-base">{optimizationResult.autoGroundLine}</div></div>
                         <div className="bg-white p-3 rounded border border-slate-100 border-l-4 border-l-red-400"><div className="text-slate-400 mb-1">回测天线</div><div className="font-bold text-red-500 text-base">{optimizationResult.autoSkyLine}</div></div>
                         <div className="bg-white p-3 rounded border border-slate-100"><div className="text-slate-400 mb-1">最大盈利</div><div className="font-bold text-emerald-500">+{Math.round(optimizationResult.stats.maxProfitVal)} ({optimizationResult.stats.maxProfitRate}%)</div></div>
