@@ -469,7 +469,9 @@
         try {
           let result;
           if (config.assetType === 'stock') {
-            result = await fetchStockRealData(codeToFetch);
+            // 先试 fund.eastmoney.com（已验证可访问），失败再试 push2his
+            try { result = await fetchFundRealData(codeToFetch); }
+            catch { result = await fetchStockRealData(codeToFetch); }
           } else {
             result = await fetchFundRealData(codeToFetch);
           }
@@ -2125,7 +2127,10 @@
         setLoadingCodes(prev => ({ ...prev, [code]: true }));
         setFetchErrors(prev => { const n = {...prev}; delete n[code]; return n; });
         try {
-          const result = await fetchStockRealData(code);
+          // 先试 fund.eastmoney.com（已验证可访问），失败再试 push2his
+          let result;
+          try { result = await fetchFundRealData(code); }
+          catch { result = await fetchStockRealData(code); }
           setEtfData(prev => ({ ...prev, [code]: { name: result.name || name, data: result.data } }));
         } catch(e) {
           setFetchErrors(prev => ({ ...prev, [code]: true }));
